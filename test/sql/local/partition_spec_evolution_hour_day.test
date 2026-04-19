@@ -1,0 +1,29 @@
+# name: test/sql/local/partition_spec_evolution_hour_day.test
+# description: Regression test for https://github.com/duckdb/duckdb-iceberg/issues/941
+#              Scanning a table whose partition spec evolved from hour(ts) to day(ts)
+#              used to crash with "Unimplemented type for cast (DATE -> INTEGER)" because
+#              Spark/PyIceberg writes the day-transform partition value as Avro 'int' +
+#              logicalType=date, and the FixSamePhysicalTypeCasts rewriter must convert
+#              the resulting DATE -> INTEGER TryVectorNullCast to ReinterpretCast.
+# group: [local]
+
+require avro
+
+require parquet
+
+require iceberg
+
+# The final metadata.json corresponds to both snapshots:
+#   spec 0 (hour(ts)): id=1, ts=2025-01-01 00:00:00
+#   spec 1 (day(ts)):  id=2, ts=2025-02-01 00:00:00
+query II
+SELECT id, ts FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persistent/partition_spec_evolution_hour_day/default/partition_spec_evolution_hour_day/metadata/00003-6bcde34e-43be-41a1-883c-0fa2fdde9997.metadata.json') ORDER BY id;
+----
+1	2025-01-01 00:00:00
+2	2025-02-01 00:00:00
+
+# also verify filtering works across the spec boundary
+query II
+SELECT id, ts FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persistent/partition_spec_evolution_hour_day/default/partition_spec_evolution_hour_day/metadata/00003-6bcde34e-43be-41a1-883c-0fa2fdde9997.metadata.json') WHERE ts >= TIMESTAMP '2025-01-15' ORDER BY id;
+----
+2	2025-02-01 00:00:00
