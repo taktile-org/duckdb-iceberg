@@ -1,2 +1,2 @@
 pydantic==2.11.1
-pyspark==3.5.0
+pyspark==3.5.2
