@@ -288,6 +288,63 @@ unique_ptr<ExpressionFilter> IcebergMultiFileList::GetFilterForColumnIndex(const
 		//! cutting to the root)
 		filter = table_filters.TryGetFilterByColumnIndex(ColumnIndex(column_index.GetPrimaryIndex()));
 	}
+}
+
+string IcebergMultiFileList::ToDuckDBPath(const string &raw_path) {
+	return raw_path;
+}
+
+string IcebergMultiFileList::GetPath() const {
+	return shared_state->path;
+}
+
+const IcebergTableMetadata &IcebergMultiFileList::GetMetadata() const {
+	return shared_state->scan_info->metadata;
+}
+
+bool IcebergMultiFileList::HasTransactionData() const {
+	return shared_state->scan_info->transaction_data;
+}
+
+const IcebergTransactionData &IcebergMultiFileList::GetTransactionData() const {
+	D_ASSERT(HasTransactionData());
+	return *shared_state->scan_info->transaction_data;
+}
+
+const IcebergSnapshotScanInfo &IcebergMultiFileList::GetSnapshot() const {
+	return shared_state->scan_info->snapshot_info;
+}
+
+const IcebergTableSchema &IcebergMultiFileList::GetSchema() const {
+	return shared_state->scan_info->schema;
+}
+
+bool IcebergMultiFileList::FinishedScanningDeletes() const {
+	return !shared_state->delete_manifest_reader || shared_state->delete_manifest_reader->Finished();
+}
+
+IcebergTableEntry *IcebergMultiFileList::GetTable() const {
+	return shared_state->table;
+}
+
+void IcebergMultiFileList::SetTable(IcebergTableEntry *table) {
+	shared_state->table = table;
+}
+
+void IcebergMultiFileList::SetOptions(const IcebergOptions &options) {
+	shared_state->options = options;
+}
+
+void IcebergMultiFileList::SetScanOrder(unique_ptr<RowGroupOrderOptions> options) {
+	scan_order_options = std::move(options);
+	scan_order_applied = false;
+}
+
+unique_ptr<ExpressionFilter> IcebergMultiFileList::GetFilterForColumnIndex(const IcebergTableFilters &filter_set,
+                                                                           const ColumnIndex &column_index) const {
+	auto primary_index = column_index.GetPrimaryIndex();
+
+	auto filter = filter_set.TryGetFilterByColumnIndex(primary_index);
 	if (!filter) {
 		return nullptr;
 	}
@@ -955,7 +1012,7 @@ struct IcebergOrderEntry {
 
 } // namespace
 
-void IcebergMultiFileList::EnsureScanOrderApplied(annotated_lock_guard<annotated_mutex> &guard) const {
+void IcebergMultiFileList::EnsureScanOrderApplied(lock_guard<mutex> &guard) const {
 	if (!scan_order_options || scan_order_applied) {
 		return;
 	}
@@ -997,7 +1054,8 @@ void IcebergMultiFileList::EnsureScanOrderApplied(annotated_lock_guard<annotated
 		//! lower/upper bounds are stored as raw Iceberg-encoded blobs; decode to typed Values before comparing.
 		auto stats = IcebergPredicateStats::DeserializeBounds(lower_it->second, upper_it->second, order_column.name,
 		                                                      order_column.type);
-		if (!stats.lower_bound || !stats.upper_bound || stats.lower_bound->IsNull() || stats.upper_bound->IsNull()) {
+		if (!stats.has_lower_bounds || !stats.has_upper_bounds || stats.lower_bound.IsNull() ||
+		    stats.upper_bound.IsNull()) {
 			return;
 		}
 		auto null_it = data_file.null_value_counts.find(field_id);
@@ -1006,8 +1064,7 @@ void IcebergMultiFileList::EnsureScanOrderApplied(annotated_lock_guard<annotated
 			//! reordering stays safe, limit pruning does not.
 			can_prune = false;
 		}
-		order_entries.push_back(
-		    {i, *stats.lower_bound, *stats.upper_bound, NumericCast<idx_t>(data_file.record_count)});
+		order_entries.push_back({i, stats.lower_bound, stats.upper_bound, NumericCast<idx_t>(data_file.record_count)});
 	}
 
 	if (can_prune) {
@@ -1073,9 +1130,10 @@ void IcebergMultiFileList::EnsureScanOrderApplied(annotated_lock_guard<annotated
 	data_manifest_entries = std::move(reordered);
 }
 
-OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, annotated_lock_guard<annotated_mutex> &guard) const {
-	InitializeView(guard);
-	StartDataManifestScan(guard);
+OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mutex> &guard) const {
+	if (!view_initialized) {
+		InitializeFiles(guard);
+	}
 	EnsureScanOrderApplied(guard);
 
 	auto found_manifest_entry = GetDataFile(file_id, guard);
