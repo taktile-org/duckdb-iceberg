@@ -62,6 +62,7 @@ static bool MatchBoundsConstantTemplated(const Value &constant, ExpressionType c
 		// has_not_null is false when every row of this column is NULL. Ordinary comparisons
 		// against a constant cannot match NULL so the file can be pruned. IS [NOT] DISTINCT FROM
 		// must consider NULL so cannot be pruned.
+		// An all-null column (Iceberg omits its bounds) only matches a null-safe comparison.
 		return false;
 	}
 
