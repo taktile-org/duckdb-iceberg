@@ -1,4 +1,5 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+// NOOP-PLACEHOLDER-PATCH: rehearsal marker for the fork/patch workflow, no behavior change.
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
