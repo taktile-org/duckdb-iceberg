@@ -4,6 +4,19 @@ Read [this ADR](https://app.notion.com/p/taktile/ADR-Forking-duckdb-iceberg-for-
 
 **Do not build against this branch.**
 
+## Tooling
+
+`cut-tag.sh` and `check-patches.sh` live on this branch (`main`), but you'll often need to run them while checked out somewhere else entirely - mid cherry-pick conflict included. `git show` reads a file from any branch's history without touching what's actually checked out, so that's how these are invoked, from anywhere in this checkout, on any branch, any state:
+
+```
+git show main:cut-tag.sh | bash -s -- [--from <prev-tag>] <sha1> [<sha2> ...]
+git show main:cut-tag.sh | bash -s -- --continue
+git show main:cut-tag.sh | bash -s -- --abort
+git show main:check-patches.sh | bash -s -- <tag>
+```
+
+No setup step, no PATH changes, nothing outside this one repo - works for anyone who's cloned it.
+
 ## Branch Layout
 
 - **`main`** (this branch) - documentation and tooling only. Nothing here gets built or deployed.
@@ -17,15 +30,17 @@ Read [this ADR](https://app.notion.com/p/taktile/ADR-Forking-duckdb-iceberg-for-
 
 1. Branch off `upstream` (`fix/<name>`), commit the fix.
 2. Push, open the PR against `duckdb/duckdb-iceberg`, targeting `main`.
-3. Include the commit in the next `cut-tag.sh` run (see below) so it's part of the deployable artifact.
+3. Include the commit in the next tag cut (see below) so it's part of the deployable artifact.
 
 ### Cutting a tag
 
 ```
-./cut-tag.sh [--from <prev-tag>] <sha1> [<sha2> ...]
+git show main:cut-tag.sh | bash -s -- [--from <prev-tag>] <sha1> [<sha2> ...]
 ```
 
 Checks out `upstream`'s current tip, cherry-picks the given commits in order, tags the result `yyyymmddThhmmZ-<base-sha>`. This is the release step - no separate "bump a version" action, the tag itself is the release. `--from <prev-tag>` seeds the patch list from that tag's own history instead of retyping every SHA.
+
+Conceptually, this is exactly:
 
 ```
 git fetch upstream main
@@ -34,14 +49,26 @@ git cherry-pick <sha1> <sha2>
 git tag -a <tag> -m "release" HEAD
 ```
 
+If a cherry-pick conflicts, resolve it by hand, `git add` the resolved files, then:
+
+```
+git show main:cut-tag.sh | bash -s -- --continue
+```
+
+which finishes the remaining steps (any further SHAs in the list, tagging, cleanup) once the conflict itself is actually resolved. To bail out entirely instead:
+
+```
+git show main:cut-tag.sh | bash -s -- --abort
+```
+
 ### Check if a patch is subsumed by upstream
 
 ```
-./check-patches.sh <tag>
+git show main:check-patches.sh | bash -s -- <tag>
 ```
 
 Parses the base SHA out of the tag name, walks every commit between that base and the tag, and checks each one against the current `upstream/main` tip. No file to keep in sync - the tag's history is the input.
 
 ### Retiring a patch
 
-There's no "retire" step on an existing tag - tags are immutable once cut. A patch that's been fixed upstream just doesn't get included the next time `cut-tag.sh` runs.
+There's no "retire" step on an existing tag - tags are immutable once cut. A patch that's been fixed upstream just doesn't get included the next time a tag is cut.
