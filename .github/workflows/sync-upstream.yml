@@ -1,0 +1,22 @@
+name: Sync upstream mirror
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream
+          fetch-depth: 0
+
+      - name: Fast-forward from duckdb/duckdb-iceberg:main
+        run: |
+          git remote add real-upstream https://github.com/duckdb/duckdb-iceberg.git
+          git fetch real-upstream main
+          git merge --ff-only real-upstream/main
+          git push origin upstream
