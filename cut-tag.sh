@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Cuts a new internal tag: fresh checkout of the upstream mirror's current tip,
 # cherry-pick the given commits (in order), tag the result. Tag name is
-# yyyymmddThhmmZ-<short-sha-of-base>, so check-patches.sh can derive the base
+# yyyymmddThhmmZ-<short-sha-of-base>, so the base is always recoverable
 # straight from the tag name later - no separate file needed.
 #
 # --from <prev-tag> seeds the patch list from a previous tag's own history

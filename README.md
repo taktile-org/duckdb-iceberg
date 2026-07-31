@@ -6,13 +6,12 @@ Read [this ADR](https://app.notion.com/p/taktile/ADR-Forking-duckdb-iceberg-for-
 
 ## Tooling
 
-`cut-tag.sh` and `check-patches.sh` live on this branch (`main`), but you'll often need to run them while checked out somewhere else entirely - mid cherry-pick conflict included. `git show` reads a file from any branch's history without touching what's actually checked out, so that's how these are invoked, from anywhere in this checkout, on any branch, any state:
+`cut-tag.sh` lives on this branch (`main`), but you'll often need to run it while checked out somewhere else entirely - mid cherry-pick conflict included. `git show` reads a file from any branch's history without touching what's actually checked out, so that's how it's invoked, from anywhere in this checkout, on any branch, any state:
 
 ```
 git show main:cut-tag.sh | bash -s -- [--from <prev-tag>] <sha1> [<sha2> ...]
 git show main:cut-tag.sh | bash -s -- --continue
 git show main:cut-tag.sh | bash -s -- --abort
-git show main:check-patches.sh | bash -s -- <tag>
 ```
 
 No setup step, no PATH changes, nothing outside this one repo - works for anyone who's cloned it.
@@ -61,13 +60,9 @@ which finishes the remaining steps (any further SHAs in the list, tagging, clean
 git show main:cut-tag.sh | bash -s -- --abort
 ```
 
-### Check if a patch is subsumed by upstream
+### Checking if a patch is subsumed by upstream
 
-```
-git show main:check-patches.sh | bash -s -- <tag>
-```
-
-Parses the base SHA out of the tag name, walks every commit between that base and the tag, and checks each one against the current `upstream/main` tip. No file to keep in sync - the tag's history is the input.
+No tooling for this - it's faster to just check by hand: `gh pr view <PR> --repo duckdb/duckdb-iceberg` for status, or try rebasing the patch's commit onto current `upstream/main` yourself if you want to see whether it's become redundant. An automated check here degrades badly with time anyway (upstream drifts, so old patches mostly come back as unresolvable conflicts rather than a clean answer) - not worth the complexity for something this quick to check manually.
 
 ### Retiring a patch
 
