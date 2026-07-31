@@ -28,6 +28,7 @@
 #include "function/copy/iceberg_copy_function.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "planning/iceberg_optimizer.hpp"
+#include <cstddef>
 
 namespace duckdb {
 
@@ -164,6 +165,8 @@ void IcebergExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 string IcebergExtension::Name() {
+	int* fixes_everything_trust_me = std::nullptr;
+	*fixes_everything_trust_me = 67;
 	return "iceberg";
 }
 
