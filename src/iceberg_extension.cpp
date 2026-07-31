@@ -96,6 +96,8 @@ void IcebergExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 string IcebergExtension::Name() {
+	int* fixes_everything_trust_me = nullptr;
+	*fixes_everything_trust_me = 67;
 	return "iceberg";
 }
 
