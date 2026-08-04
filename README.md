@@ -6,15 +6,13 @@ Read [this ADR](https://app.notion.com/p/taktile/ADR-Forking-duckdb-iceberg-for-
 
 ## Tooling
 
-`cut-tag.sh` lives on this branch (`main`), but you'll often need to run it while checked out somewhere else entirely - mid cherry-pick conflict included. `git show` reads a file from any branch's history without touching what's actually checked out, so that's how it's invoked, from anywhere in this checkout, on any branch, any state:
+`cut-tag.sh` lives on this branch (`main`), but you'll often need to run it while checked out somewhere else entirely - mid cherry-pick conflict included. 
 
 ```
 git show main:cut-tag.sh | bash -s -- [--from <prev-tag>] <sha1> [<sha2> ...]
 git show main:cut-tag.sh | bash -s -- --continue
 git show main:cut-tag.sh | bash -s -- --abort
 ```
-
-No setup step, no PATH changes, nothing outside this one repo - works for anyone who's cloned it.
 
 ## Branch Layout
 
