@@ -23,6 +23,11 @@ set -euo pipefail
 # the tag name (recomputing it fresh would give a different timestamp) and
 # which branch to return to - both stashed in a small state file for exactly
 # this purpose, removed once the cut actually finishes.
+#
+# A fresh cut also fast-forwards the fork's upstream branch from
+# duckdb/duckdb-iceberg:main first - done here rather than in CI because this
+# fork is public and the org's self-hosted runners don't grant public repos
+# access.
 
 GIT_DIR="$(git rev-parse --git-dir)"
 STATE_FILE="$GIT_DIR/CUT_TAG_STATE"
@@ -128,8 +133,11 @@ if [[ -f "$STATE_FILE" ]]; then
   exit 1
 fi
 
-UPSTREAM_MIRROR="taktile/upstream"  # the fork's auto-synced mirror of duckdb/duckdb-iceberg:main
+UPSTREAM_MIRROR="taktile/upstream"  # the fork's mirror branch, tracking duckdb/duckdb-iceberg:main
 
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='url.git@github.com:.insteadOf' GIT_CONFIG_VALUE_0='https://github.com/' \
+  git fetch upstream main --quiet
+git push taktile upstream/main:refs/heads/upstream
 git fetch taktile upstream --quiet
 
 SHAS=()
