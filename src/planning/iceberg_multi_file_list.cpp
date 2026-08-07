@@ -242,9 +242,16 @@ void IcebergMultiFileList::Bind(vector<LogicalType> &return_types, vector<string
 		    make_shared_ptr<IcebergScanInfo>(iceberg_path, std::move(temp_data), snapshot_info, *schema);
 	}
 
-	if (!view_initialized) {
-		InitializeFiles(guard);
-	}
+	// NOTE: deliberately does NOT call InitializeFiles here (unlike the upstream implementation this
+	// forked from). The only thing used below is GetSchema().columns, which comes from
+	// shared_state->scan_info->schema - resolved from metadata.json above, independent of any
+	// manifest data. InitializeFiles's result (data_manifests/data_manifest_matches) was never
+	// consumed by Bind(). Calling it here runs at bind time, before ComplexFilterPushdown has had a
+	// chance to run, so table_filters is always empty - every manifest "matches" and the single-shot
+	// shared_state->data_manifest_scan_started latch locks in a full unfiltered read for the rest of
+	// the query. That's the actual OPTI-10702 regression: confirmed via a real backtrace that this
+	// exact call site, not GetExpandResult, is what fires first for a plain `SELECT ... WHERE
+	// <partition col> = <value>` against an attached table.
 
 	auto &schema = GetSchema().columns;
 	for (auto &schema_entry : schema) {
@@ -351,9 +358,15 @@ vector<OpenFileInfo> IcebergMultiFileList::GetAllFiles() const {
 }
 
 FileExpandResult IcebergMultiFileList::GetExpandResult() const {
-	// GetFileInternal(1) will ensure files with index 0 and index 1 are expanded if they are available
-	lock_guard<mutex> guard(shared_state->lock);
-	GetFileInternal(1, guard);
+	// NOTE: deliberately does NOT call GetFileInternal(1) to "warm up" file materialization (as the
+	// upstream implementation does) - its result was discarded anyway (this always returns
+	// MULTIPLE_FILES regardless), and nothing outside this file reads 'data_manifest_entries'. That
+	// warm-up call runs at bind time, before ComplexFilterPushdown has had a chance to run, so
+	// table_filters is always empty here - every manifest "matches" and the single-shot
+	// shared_state->data_manifest_scan_started latch would lock in a full unfiltered read for the rest
+	// of the query, which is exactly the OPTI-10702 regression this file's other changes fix. Confirmed
+	// by direct instrumentation: a plain `SELECT ... WHERE <partition col> = <value>` still scheduled
+	// both manifests (not just the matching one) with this call present.
 
 	// always return multiple files, In the case there is only 1 data file,
 	// we only lose performance if it is small
@@ -361,15 +374,20 @@ FileExpandResult IcebergMultiFileList::GetExpandResult() const {
 }
 
 idx_t IcebergMultiFileList::GetTotalFileCount() const {
-	// FIXME: the 'added_files_count' + the 'existing_files_count'
-	// in the Manifest List should give us this information without scanning the manifest file(s)
 	lock_guard<mutex> guard(shared_state->lock);
+	InitializeFiles(guard);
 
-	idx_t i = data_manifest_entries.size();
-	while (!GetFileInternal(i, guard).path.empty()) {
-		i++;
+	// The manifest-list entry already carries the live (ADDED + EXISTING) file count for each manifest,
+	// so this doesn't need the manifest file(s) themselves to be read.
+	idx_t count = 0;
+	for (idx_t i = 0; i < data_manifests.size(); i++) {
+		if (!data_manifest_matches[i]) {
+			continue;
+		}
+		auto &manifest = data_manifests[i].entry.file;
+		count += manifest.added_files_count + manifest.existing_files_count;
 	}
-	return data_manifest_entries.size();
+	return count;
 }
 
 unique_ptr<NodeStatistics> IcebergMultiFileList::GetCardinality(ClientContext &context) const {
@@ -991,6 +1009,13 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
 	if (!view_initialized) {
 		InitializeFiles(guard);
 	}
+	// Scheduling the data-manifest avro read belongs here, not inside InitializeFiles: InitializeFiles is
+	// also reached by callers that only need the match/delete side (GetDeleteManifestEntries,
+	// GetTotalFileCount, Bind) without ever consuming a data file, and nesting the schedule call there
+	// made every one of those callers pay for it too - including ones invoked before filter pushdown
+	// (e.g. the GuaranteeEqualityDeleteColumnsOptimizer PreOptimize pass), reintroducing the exact
+	// OPTI-10702 regression via a different call path. Only actual per-file consumption needs it.
+	ScheduleDataManifestScan(guard);
 	EnsureScanOrderApplied(guard);
 
 	auto found_manifest_entry = GetDataFile(file_id, guard);
@@ -1161,6 +1186,12 @@ void IcebergMultiFileList::InitializeFiles(lock_guard<mutex> &guard) const {
 		data_manifest_matches.push_back(ManifestMatchesFilter(manifest.get().file));
 	}
 
+	//! NOTE: scheduling the data-manifest avro read does NOT happen here. InitializeFiles only computes
+	//! match decisions (cheap, list-level) and is shared by callers - GetDeleteManifestEntries,
+	//! GetTotalFileCount, Bind - that never consume a data file and can run before filter pushdown.
+	//! ScheduleDataManifestScan is called from GetFileInternal instead, the one path that actually needs
+	//! data-file entries.
+
 	auto &committed_delete_manifests = shared_state->committed_delete_manifests;
 	auto &transaction_delete_manifests = shared_state->transaction_delete_manifests;
 	delete_manifests.reserve(committed_delete_manifests.size() + transaction_delete_manifests.size());
@@ -1261,30 +1292,59 @@ void IcebergMultiFileList::InitializeSharedState(lock_guard<mutex> &guard) const
 		    ManifestReadBatch {transaction_manifest_idx++, 0, manifest.get().manifest_entries.size()});
 	}
 
-	if (!shared_state->committed_data_manifests.empty()) {
-		auto &metadata = GetMetadata();
-		auto &snapshot_info = GetSnapshot();
-		auto iceberg_path = GetPath();
-		auto &fs = FileSystem::GetFileSystem(context);
+	//! NOTE: scheduling the avro read for 'committed_data_manifests' happens later, in
+	//! ScheduleDataManifestScan, once a filter-aware match decision is available per manifest. Reading
+	//! every committed data manifest here unconditionally is what caused OPTI-10702: 1.5.x fetched every
+	//! manifest a partition-bound prune would go on to discard, turning a single-decision lookup into an
+	//! O(total manifests) scan.
+	shared_state->initialized = true;
+}
 
-		auto data_scan = AvroScan::ScanManifest(snapshot_info, shared_state->committed_data_manifests, options, fs,
-		                                        iceberg_path, metadata, context, &shared_state->read_state);
-		shared_state->data_manifest_read_state = make_uniq<IcebergManifestScanningState>(
-		    context, std::move(data_scan), shared_state->committed_data_manifests);
-		shared_state->data_manifest_reader =
-		    make_uniq<manifest_file::ManifestReader>(*shared_state->data_manifest_read_state->scan);
+void IcebergMultiFileList::ScheduleDataManifestScan(lock_guard<mutex> &guard) const {
+	if (shared_state->data_manifest_scan_started) {
+		return;
+	}
+	shared_state->data_manifest_scan_started = true;
 
-		auto &executor = shared_state->data_manifest_read_state->executor;
-		auto &scheduler = TaskScheduler::GetScheduler(context);
-		auto worker_thread_count = scheduler.NumberOfThreads();
-
-		auto num_threads = MinValue<idx_t>(worker_thread_count, shared_state->committed_data_manifests.size());
-		shared_state->data_manifest_read_state->in_progress_tasks = num_threads;
-		for (idx_t i = 0; i < num_threads; i++) {
-			executor.ScheduleTask(make_uniq<ManifestReadTask>(*shared_state->data_manifest_read_state));
+	auto &committed_data_manifests = shared_state->committed_data_manifests;
+	auto &selected_manifests = shared_state->data_manifest_selected_indices;
+	selected_manifests.reserve(committed_data_manifests.size());
+	for (idx_t i = 0; i < committed_data_manifests.size(); i++) {
+		if (data_manifest_matches[i]) {
+			selected_manifests.push_back(i);
 		}
 	}
-	shared_state->initialized = true;
+
+	if (committed_data_manifests.size() > selected_manifests.size()) {
+		DUCKDB_LOG(context, IcebergLogType, "Iceberg Manifest Read Pushdown, opening %llu of %llu 'manifest_file's",
+		           selected_manifests.size(), committed_data_manifests.size());
+	}
+
+	if (selected_manifests.empty()) {
+		return;
+	}
+
+	auto &metadata = GetMetadata();
+	auto &snapshot_info = GetSnapshot();
+	auto iceberg_path = GetPath();
+	auto &fs = FileSystem::GetFileSystem(context);
+
+	auto data_scan = AvroScan::ScanManifest(snapshot_info, committed_data_manifests, options, fs, iceberg_path,
+	                                        metadata, context, &shared_state->read_state, &selected_manifests);
+	shared_state->data_manifest_read_state =
+	    make_uniq<IcebergManifestScanningState>(context, std::move(data_scan), committed_data_manifests);
+	shared_state->data_manifest_reader =
+	    make_uniq<manifest_file::ManifestReader>(*shared_state->data_manifest_read_state->scan);
+
+	auto &executor = shared_state->data_manifest_read_state->executor;
+	auto &scheduler = TaskScheduler::GetScheduler(context);
+	auto worker_thread_count = scheduler.NumberOfThreads();
+
+	auto num_threads = MinValue<idx_t>(worker_thread_count, selected_manifests.size());
+	shared_state->data_manifest_read_state->in_progress_tasks = num_threads;
+	for (idx_t i = 0; i < num_threads; i++) {
+		executor.ScheduleTask(make_uniq<ManifestReadTask>(*shared_state->data_manifest_read_state));
+	}
 }
 
 void IcebergMultiFileList::EnumerateDeleteManifestEntriesInternal() const {

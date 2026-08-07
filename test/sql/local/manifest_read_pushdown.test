@@ -1,0 +1,75 @@
+# name: test/sql/local/manifest_read_pushdown.test
+# description: Regression test for OPTI-10702 - DuckDB 1.5.x read every committed data
+#              manifest before ManifestMatchesFilter's partition-bound prune discarded it,
+#              turning a single-decision lookup into an O(total manifests) scan. This
+#              asserts the manifest AVRO file itself is skipped, not just the prune
+#              decision (the skip-decision log fires identically whether or not the file
+#              is actually opened afterward, so it alone cannot guard this).
+# group: [local]
+
+require avro
+
+require parquet
+
+require iceberg
+
+statement ok
+SET unsafe_enable_version_guessing = true;
+
+statement ok
+attach ':memory:' as my_datalake;
+
+statement ok
+create schema my_datalake.default;
+
+# Two data manifests, split by event_date range: one covers 2024-01-01/01-02 (2 files),
+# the other covers 2024-01-03/01-04 with a partition-spec evolution (4 files).
+statement ok
+create view my_datalake.default.hpt as select * from iceberg_scan('__WORKING_DIRECTORY__/data/persistent/hive_partitioned_table/metadata/v4.metadata.json');
+
+statement ok
+CALL enable_logging('Iceberg');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Prunes: a filter matching only the first manifest's range must not open the second one.
+query I
+select count(*) from my_datalake.default.hpt where event_date = DATE '2024-01-01';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'Iceberg' AND message = 'Iceberg Manifest Read Pushdown, opening 1 of 2 ''manifest_file''s';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Declines to prune: a filter matching only the OTHER manifest must still correctly open it -
+# proves the pruning isn't just "always keep manifest 1", it tracks the real match per manifest.
+query I
+select count(*) from my_datalake.default.hpt where event_date = DATE '2024-01-04';
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'Iceberg' AND message = 'Iceberg Manifest Read Pushdown, opening 1 of 2 ''manifest_file''s';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Declines to prune: no filter at all needs every manifest - no pushdown log should fire,
+# and every row across both manifests/partition specs must come back.
+query I
+select count(*) from my_datalake.default.hpt;
+----
+6
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'Iceberg' AND message LIKE 'Iceberg Manifest Read Pushdown%';
+----
+0

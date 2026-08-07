@@ -68,8 +68,19 @@ public:
 	IcebergManifestFileScanInfo(const IcebergTableMetadata &metadata, const IcebergSnapshotScanInfo &snapshot_info,
 	                            vector<IcebergManifestListEntry> &manifest_files, const IcebergOptions &options,
 	                            FileSystem &fs, const string &iceberg_pat,
-	                            optional_ptr<ManifestEntryReadState> read_state);
+	                            optional_ptr<ManifestEntryReadState> read_state,
+	                            optional_ptr<const vector<idx_t>> selected_indices = nullptr);
 	virtual ~IcebergManifestFileScanInfo();
+
+public:
+	//! Number of manifests this scan will actually open: manifest_files.size() unless 'selected_indices' narrows it.
+	idx_t SelectedCount() const {
+		return selected_indices ? selected_indices->size() : manifest_files.size();
+	}
+	//! Maps a 0-based position within this scan's open files back to its index in 'manifest_files'.
+	idx_t SelectedIndex(idx_t i) const {
+		return selected_indices ? (*selected_indices)[i] : i;
+	}
 
 public:
 	vector<IcebergManifestListEntry> &manifest_files;
@@ -79,6 +90,9 @@ public:
 	//! partition_field_id -> semantic column type (e.g. INTEGER for DAY)
 	map<idx_t, LogicalType> partition_field_id_to_type;
 	optional_ptr<ManifestEntryReadState> read_state;
+	//! When set, only these indices into 'manifest_files' are opened/read - the rest are left untouched
+	//! (never read from storage). Used to defer reading manifests a filter-bound prune already ruled out.
+	optional_ptr<const vector<idx_t>> selected_indices;
 };
 
 class IcebergAvroMultiFileList : public SimpleMultiFileList {
