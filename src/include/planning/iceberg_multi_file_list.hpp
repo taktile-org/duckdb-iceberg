@@ -71,6 +71,12 @@ private:
 	mutable ManifestEntryReadState read_state;
 
 	mutable bool initialized = false;
+	//! Guards scheduling of the data-manifest avro read: set once, by whichever clone first reaches
+	//! ScheduleDataManifestScan. Filter-pushdown clones only ever add filters onto their parent's (see
+	//! PushdownInternal), so the first clone to reach this point has the least restrictive filter set of any
+	//! clone that will ever scan this shared_state, and its 'data_manifest_matches' is a superset of every
+	//! later clone's.
+	mutable bool data_manifest_scan_started = false;
 
 	//! Scanned delete manifests and their owners.
 	mutable vector<IcebergManifestListEntry> committed_delete_manifests;
@@ -86,6 +92,10 @@ private:
 	mutable vector<reference<const IcebergManifestListEntry>> transaction_data_manifests;
 	mutable unique_ptr<IcebergManifestScanningState> data_manifest_read_state;
 	mutable unique_ptr<manifest_file::ManifestReader> data_manifest_reader;
+	//! Indices into 'committed_data_manifests' selected for reading by ScheduleDataManifestScan. Owned here
+	//! (not a local in ScheduleDataManifestScan) because IcebergManifestFileScanInfo/AvroScan hold a
+	//! non-owning pointer to it for the lifetime of the async manifest read tasks.
+	mutable vector<idx_t> data_manifest_selected_indices;
 
 	//! Declared after the manifest owners so references in parsed delete data are destroyed first.
 	mutable case_insensitive_map_t<shared_ptr<IcebergDeleteData>> positional_delete_data;
@@ -178,6 +188,10 @@ private:
 	bool TryGetNextBatch(lock_guard<mutex> &guard) const;
 	void FinishScanTasks(lock_guard<mutex> &guard) const;
 	void InitializeSharedState(lock_guard<mutex> &guard) const;
+	//! Schedules the avro read for committed data manifests, restricted to the ones 'data_manifest_matches'
+	//! (already computed by InitializeFiles for this instance's table_filters) marks as possibly-matching.
+	//! No-ops on every clone after the first to reach it - see the comment on shared_state->data_manifest_scan_started.
+	void ScheduleDataManifestScan(lock_guard<mutex> &guard) const;
 	bool FinishedScanningDeletes() const;
 	void EnumerateDeleteManifestEntriesInternal() const;
 	void ProcessDeletesInternal(const vector<MultiFileColumnDefinition> &global_columns,

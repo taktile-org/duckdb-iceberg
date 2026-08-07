@@ -23,12 +23,14 @@ IcebergManifestFileScanInfo::IcebergManifestFileScanInfo(const IcebergTableMetad
                                                          vector<IcebergManifestListEntry> &manifest_files,
                                                          const IcebergOptions &options, FileSystem &fs,
                                                          const string &iceberg_path,
-                                                         optional_ptr<ManifestEntryReadState> read_state)
+                                                         optional_ptr<ManifestEntryReadState> read_state,
+                                                         optional_ptr<const vector<idx_t>> selected_indices)
     : IcebergAvroScanInfo(TYPE, metadata, snapshot_info), manifest_files(manifest_files), options(options), fs(fs),
-      iceberg_path(iceberg_path), read_state(read_state) {
+      iceberg_path(iceberg_path), read_state(read_state), selected_indices(selected_indices) {
 	unordered_set<int32_t> partition_spec_ids;
-	for (auto &manifest_list_entry : manifest_files) {
-		auto &manifest = manifest_list_entry.file;
+	auto selected_count = SelectedCount();
+	for (idx_t i = 0; i < selected_count; i++) {
+		auto &manifest = manifest_files[SelectedIndex(i)].file;
 		partition_spec_ids.insert(manifest.partition_spec_id);
 	}
 	//! The schema of a manifest is affected by the 'partition_spec_id' of the 'manifest_file',

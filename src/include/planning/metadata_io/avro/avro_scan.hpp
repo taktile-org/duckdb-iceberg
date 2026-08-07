@@ -32,7 +32,8 @@ public:
 	                                         vector<IcebergManifestListEntry> &manifest_files,
 	                                         const IcebergOptions &options, FileSystem &fs, const string &iceberg_path,
 	                                         const IcebergTableMetadata &metadata, ClientContext &context,
-	                                         optional_ptr<ManifestEntryReadState> read_state = nullptr);
+	                                         optional_ptr<ManifestEntryReadState> read_state = nullptr,
+	                                         optional_ptr<const vector<idx_t>> selected_indices = nullptr);
 
 public:
 	void InitializeChunk(DataChunk &chunk) const;

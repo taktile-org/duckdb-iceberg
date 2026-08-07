@@ -516,7 +516,9 @@ void IcebergAvroMultiFileReader::FinalizeChunk(ClientContext &context, const Mul
 	switch (scan_info->type) {
 	case AvroScanInfoType::MANIFEST_FILE: {
 		auto &manifest_scan_info = scan_info->Cast<IcebergManifestFileScanInfo>();
-		auto manifest_file_idx = reader.file_list_idx.GetIndex();
+		//! 'file_list_idx' is a position among this scan's (possibly narrowed) open files; translate it back
+		//! to the manifest's real index in 'manifest_files' so read_state batches and cross-references line up.
+		auto manifest_file_idx = manifest_scan_info.SelectedIndex(reader.file_list_idx.GetIndex());
 		auto &manifest_file = manifest_scan_info.manifest_files[manifest_file_idx];
 
 		idx_t start_index = manifest_file.manifest_entries.size();
@@ -561,8 +563,9 @@ shared_ptr<MultiFileList> IcebergAvroMultiFileReader::CreateFileList(ClientConte
 		auto &options = manifest_files_scan.options;
 		auto &fs = manifest_files_scan.fs;
 		auto &iceberg_path = manifest_files_scan.iceberg_path;
-		for (idx_t i = 0; i < manifest_files.size(); i++) {
-			auto &manifest = manifest_files[i];
+		auto selected_count = manifest_files_scan.SelectedCount();
+		for (idx_t i = 0; i < selected_count; i++) {
+			auto &manifest = manifest_files[manifest_files_scan.SelectedIndex(i)];
 			auto full_path = options.allow_moved_paths
 			                     ? IcebergUtils::GetFullPath(iceberg_path, manifest.file.manifest_path, fs)
 			                     : manifest.file.manifest_path;

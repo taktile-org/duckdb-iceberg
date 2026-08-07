@@ -66,10 +66,12 @@ unique_ptr<AvroScan> AvroScan::ScanManifest(const IcebergSnapshotScanInfo &snaps
                                             vector<IcebergManifestListEntry> &manifest_files,
                                             const IcebergOptions &options, FileSystem &fs, const string &iceberg_path,
                                             const IcebergTableMetadata &metadata, ClientContext &context,
-                                            optional_ptr<ManifestEntryReadState> read_state) {
+                                            optional_ptr<ManifestEntryReadState> read_state,
+                                            optional_ptr<const vector<idx_t>> selected_indices) {
 	D_ASSERT(!manifest_files.empty());
+	D_ASSERT(!selected_indices || !selected_indices->empty());
 	auto avro_scan_info = make_shared_ptr<IcebergManifestFileScanInfo>(metadata, snapshot_info, manifest_files, options,
-	                                                                   fs, iceberg_path, read_state);
+	                                                                   fs, iceberg_path, read_state, selected_indices);
 	return make_uniq<AvroScan>("placeholder", context, std::move(avro_scan_info));
 }
 
