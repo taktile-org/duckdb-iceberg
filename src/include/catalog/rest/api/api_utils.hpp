@@ -39,6 +39,17 @@ public:
 	                                        ClientContext &context, const IRCEndpointBuilder &endpoint_builder,
 	                                        HTTPHeaders &headers, const string &data);
 
+	//! Run `send`, re-sending it while the response carries a transient gateway status that DuckDB
+	//! itself does not treat as retryable. HTTPResponse::ShouldRetry() covers 408/418/429/500/503/504,
+	//! so a 502 from a catalog behind a load balancer (Glue, S3Tables) reaches the caller as a hard
+	//! error on the very first response, where a 500 from the same endpoint would have been absorbed.
+	//! Attempt count and backoff mirror HTTPUtil::RunRequestWithRetry, and ShouldRetry() gates the
+	//! re-send, so this is inert on a DuckDB whose own list already contains the status. Only
+	//! idempotent requests may be routed through here: a re-send is a second, indistinguishable
+	//! request as far as the server is concerned.
+	static unique_ptr<HTTPResponse> SendWithGatewayRetry(const HTTPParams &params,
+	                                                     const std::function<unique_ptr<HTTPResponse>()> &send);
+
 	//! We use a singleton here to store the path, set by SelectCurlCertPath
 	static const string &GetCURLCertPath();
 };

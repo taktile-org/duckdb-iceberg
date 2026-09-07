@@ -1,0 +1,56 @@
+# name: test/sql/local/catalog_custom_setup/sigv4_mock/test_sigv4_retry_502.test
+# description: test that a transient 502 from the catalog is re-sent instead of surfacing to the caller
+# group: [sigv4_mock]
+
+# Requires: python3 scripts/sigv4_mock_server.py 19131 --fail-first 1
+require-env SIGV4_MOCK_502_SERVER_AVAILABLE
+
+require avro
+
+require parquet
+
+require iceberg
+
+require httpfs
+
+require aws
+
+set ignore_error_messages
+
+# Create an S3 secret with fake credentials for SigV4 signing
+statement ok
+CREATE SECRET sigv4_502_secret (
+    TYPE S3,
+    KEY_ID 'test_key_id',
+    SECRET 'test_secret_key',
+    REGION 'us-east-1'
+);
+
+statement ok
+call enable_logging(level='debug');
+
+# The mock answers its first GET with a 502. The attach issues GET /v1/config through the
+# SigV4 signing path, so it can only succeed if that response was re-sent.
+statement ok
+attach 'test_warehouse' as sigv4_502_catalog (
+    type ICEBERG,
+    ENDPOINT 'http://127.0.0.1:19131',
+    AUTHORIZATION_TYPE 'sigv4',
+    SIGV4_REGION 'us-east-1',
+    SIGV4_SERVICE 'execute-api'
+);
+
+# Verify: two requests for one config read - the 502 and the re-send that succeeded
+query I
+select count(*) >= 2 from duckdb_logs_parsed('HTTP') where starts_with(request.url, 'http://127.0.0.1:19131/v1/config');
+----
+true
+
+statement ok
+detach sigv4_502_catalog;
+
+statement ok
+call disable_logging();
+
+statement ok
+drop secret sigv4_502_secret;

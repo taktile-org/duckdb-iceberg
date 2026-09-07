@@ -9,6 +9,7 @@
 #include "mbedtls_wrapper.hpp"
 
 #include "iceberg_logging.hpp"
+#include "catalog/rest/api/api_utils.hpp"
 #include "catalog/rest/storage/iceberg_authorization.hpp"
 
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
@@ -349,7 +350,7 @@ unique_ptr<HTTPResponse> AWSInput::ExecuteRequest(ClientContext &context, Aws::H
 	switch (method) {
 	case Aws::Http::HttpMethod::HTTP_HEAD: {
 		HeadRequestInfo head_request(request_url, res, *params);
-		return http_util.Request(head_request, client);
+		return APIUtils::SendWithGatewayRetry(*params, [&]() { return http_util.Request(head_request, client); });
 	}
 	case Aws::Http::HttpMethod::HTTP_DELETE: {
 		DeleteRequestInfo delete_request(request_url, res, *params);
@@ -357,7 +358,7 @@ unique_ptr<HTTPResponse> AWSInput::ExecuteRequest(ClientContext &context, Aws::H
 	}
 	case Aws::Http::HttpMethod::HTTP_GET: {
 		GetRequestInfo get_request(request_url, res, *params, nullptr, nullptr);
-		return http_util.Request(get_request, client);
+		return APIUtils::SendWithGatewayRetry(*params, [&]() { return http_util.Request(get_request, client); });
 	}
 	case Aws::Http::HttpMethod::HTTP_POST: {
 		PostRequestInfo post_request(request_url, res, *params, reinterpret_cast<const_data_ptr_t>(body.c_str()),
