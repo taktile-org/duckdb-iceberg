@@ -128,6 +128,13 @@ static unique_ptr<FunctionData> IcebergMetaDataBind(ClientContext &context, Tabl
 			}
 			snapshot_lookup.SetSource(SnapshotSource::FROM_TIMESTAMP);
 			snapshot_lookup.snapshot_timestamp = val.GetValue<timestamp_t>();
+		} else if (loption == "snapshot_from_ref") {
+			if (snapshot_lookup.GetSource() != SnapshotSource::LATEST) {
+				throw InvalidInputException(
+				    "Can only use one of 'snapshot_from_id', 'snapshot_from_timestamp' and 'snapshot_from_ref'");
+			}
+			snapshot_lookup.SetSource(SnapshotSource::FROM_REF);
+			snapshot_lookup.snapshot_ref = StringValue::Get(val);
 		}
 	}
 
@@ -219,6 +226,7 @@ TableFunctionSet IcebergFunctions::GetIcebergMetadataFunction() {
 	fun.named_parameters["version_name_format"] = LogicalType::VARCHAR;
 	fun.named_parameters["snapshot_from_timestamp"] = LogicalType::TIMESTAMP;
 	fun.named_parameters["snapshot_from_id"] = LogicalType::UBIGINT;
+	fun.named_parameters["snapshot_from_ref"] = LogicalType::VARCHAR;
 	function_set.AddFunction(fun);
 
 	return function_set;

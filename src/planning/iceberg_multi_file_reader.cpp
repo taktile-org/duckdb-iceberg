@@ -473,6 +473,15 @@ bool IcebergMultiFileReader::ParseOption(const string &key, const Value &val, Mu
 		snapshot_lookup.snapshot_timestamp = val.GetValue<timestamp_t>();
 		return true;
 	}
+	if (loption == "snapshot_from_ref") {
+		if (snapshot_lookup.GetSource() != SnapshotSource::LATEST) {
+			throw InvalidInputException(
+			    "Can only use one of 'snapshot_from_id', 'snapshot_from_timestamp' and 'snapshot_from_ref'");
+		}
+		snapshot_lookup.SetSource(SnapshotSource::FROM_REF);
+		snapshot_lookup.snapshot_ref = StringValue::Get(val);
+		return true;
+	}
 	return MultiFileReader::ParseOption(key, val, options, context);
 }
 

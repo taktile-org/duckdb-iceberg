@@ -126,6 +126,20 @@ optional_ptr<const IcebergSnapshot> IcebergTableMetadata::GetSnapshotById(int64_
 	return snapshot;
 }
 
+const IcebergSnapshotRef &IcebergTableMetadata::GetSnapshotRef(const string &ref_name) const {
+	auto it = refs.find(ref_name);
+	if (it == refs.end()) {
+		vector<string> ref_names;
+		for (auto &entry : refs) {
+			ref_names.push_back(entry.first);
+		}
+		std::sort(ref_names.begin(), ref_names.end());
+		throw InvalidInputException("Could not find branch or tag '%s', available refs: [%s]", ref_name,
+		                            StringUtil::Join(ref_names, ", "));
+	}
+	return it->second;
+}
+
 IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotLookup &lookup) const {
 	IcebergSnapshotScanInfo snapshot_info;
 	switch (lookup.GetSource()) {
@@ -145,6 +159,14 @@ IcebergSnapshotScanInfo IcebergTableMetadata::GetSnapshot(const IcebergSnapshotL
 			snapshot_info.schema_id = GetCurrentSchemaId();
 		}
 		return snapshot_info;
+	case SnapshotSource::FROM_REF: {
+		auto &ref = GetSnapshotRef(lookup.snapshot_ref);
+		snapshot_info.snapshot = GetSnapshotById(ref.snapshot_id);
+		//! SPEC: a branch reads with the table's current schema, a tag with its snapshot's schema
+		//! (Java's SnapshotUtil.schemaFor).
+		snapshot_info.schema_id = ref.IsBranch() ? GetCurrentSchemaId() : snapshot_info.snapshot->GetSchemaId();
+		return snapshot_info;
+	}
 	default:
 		throw InternalException("SnapshotSource type not implemented");
 	}
@@ -407,6 +429,22 @@ IcebergTableMetadata IcebergTableMetadata::FromTableMetadata(const rest_api_obje
 		res.current_snapshot_id = table_metadata.current_snapshot_id;
 	} else {
 		res.has_current_snapshot = false;
+	}
+
+	if (table_metadata.has_refs) {
+		for (auto &entry : table_metadata.refs.additional_properties) {
+			IcebergSnapshotRef ref;
+			ref.type = entry.second.type;
+			ref.snapshot_id = entry.second.snapshot_id;
+			res.refs.emplace(entry.first, std::move(ref));
+		}
+	}
+	//! SPEC: 'refs' may be omitted by older writers, 'main' then points at current-snapshot-id
+	if (res.has_current_snapshot && res.refs.find("main") == res.refs.end()) {
+		IcebergSnapshotRef main_ref;
+		main_ref.type = "branch";
+		main_ref.snapshot_id = res.current_snapshot_id;
+		res.refs.emplace("main", std::move(main_ref));
 	}
 
 	if (table_metadata.has_last_sequence_number) {

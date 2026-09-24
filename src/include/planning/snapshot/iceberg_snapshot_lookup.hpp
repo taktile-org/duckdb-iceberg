@@ -5,12 +5,14 @@
 
 namespace duckdb {
 
-enum class SnapshotSource : uint8_t { LATEST, FROM_TIMESTAMP, FROM_ID };
+enum class SnapshotSource : uint8_t { LATEST, FROM_TIMESTAMP, FROM_ID, FROM_REF };
 
 struct IcebergSnapshotLookup {
 public:
 	int64_t snapshot_id;
 	timestamp_t snapshot_timestamp;
+	//! Name of a branch or tag from the table metadata's 'refs'
+	string snapshot_ref;
 
 public:
 	SnapshotSource GetSource() const {

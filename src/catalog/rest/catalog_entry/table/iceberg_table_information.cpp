@@ -501,7 +501,7 @@ optional_ptr<CatalogEntry> IcebergTableInformation::GetSchemaVersion(ClientConte
 			//! Not reachable by the current transaction
 			return nullptr;
 		}
-		schema_id = snapshot.GetSchemaId();
+		schema_id = snapshot_info.schema_id;
 	} else {
 		bool use_metadata_log = true;
 		Value val;
