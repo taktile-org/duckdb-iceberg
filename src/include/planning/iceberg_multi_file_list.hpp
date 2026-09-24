@@ -96,6 +96,13 @@ private:
 	//! (not a local in ScheduleDataManifestScan) because IcebergManifestFileScanInfo/AvroScan hold a
 	//! non-owning pointer to it for the lifetime of the async manifest read tasks.
 	mutable vector<idx_t> data_manifest_selected_indices;
+	//! Set when ScheduleDataManifestScan chose to read the selected manifests lazily, one at a time and in
+	//! scan order, from TryGetNextBatch (see there) instead of all up front.
+	mutable bool lazy_data_manifest_read = false;
+	//! Next position in 'data_manifest_selected_indices' to consider in lazy mode.
+	mutable idx_t next_lazy_manifest = 0;
+	//! Single-manifest selection for the lazy read in progress (AvroScan holds a pointer to it).
+	mutable vector<idx_t> lazy_manifest_index;
 
 	//! Declared after the manifest owners so references in parsed delete data are destroyed first.
 	mutable case_insensitive_map_t<shared_ptr<IcebergDeleteData>> positional_delete_data;
@@ -195,6 +202,10 @@ private:
 	//! With a scan order set, sorts 'selected' so manifests whose partition summary bound of the order column is
 	//! most promising come first (upper bound descending for DESC, lower bound ascending for ASC).
 	void OrderManifestsForScanOrder(vector<idx_t> &selected) const;
+	//! Whether a runtime (e.g. TOP_N) dynamic filter is pushed on the scan-order column.
+	bool HasScanOrderDynamicFilter() const;
+	//! Reorders a just-read manifest's entries by the scan-order column's file bound (lazy mode only).
+	void OrderManifestEntriesForScanOrder(IcebergManifestListEntry &manifest) const;
 	bool FinishedScanningDeletes() const;
 	void EnumerateDeleteManifestEntriesInternal() const;
 	void ProcessDeletesInternal(const vector<MultiFileColumnDefinition> &global_columns,

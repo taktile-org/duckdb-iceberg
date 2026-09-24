@@ -10,6 +10,7 @@
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -313,6 +314,18 @@ bool MatchBoundsTemplated(ClientContext &context, const TableFilter &filter, con
 		default:
 			return true;
 		}
+	}
+	case TableFilterType::DYNAMIC_FILTER: {
+		//! Runtime filter, e.g. the boundary a TOP_N pushes once it holds its N rows: evaluate its current value.
+		auto &dynamic_filter = filter.Cast<DynamicFilter>();
+		if (!dynamic_filter.filter_data) {
+			return true;
+		}
+		lock_guard<mutex> guard(dynamic_filter.filter_data->lock);
+		if (!dynamic_filter.filter_data->initialized || !dynamic_filter.filter_data->filter) {
+			return true;
+		}
+		return MatchBoundsConstantFilter<TRANSFORM>(*dynamic_filter.filter_data->filter, stats, transform);
 	}
 	default:
 		//! Conservative approach: we don't know what this is, just say it doesn't filter anything

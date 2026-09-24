@@ -1,0 +1,95 @@
+# name: test/sql/local/iceberg_scans/scan_order_dynamic_filter.test
+# group: [iceberg_scans]
+
+require avro
+
+require parquet
+
+require iceberg
+
+# scan_order_dynamic_filter: 8 day-partitioned commits made in shuffled day order, one manifest and one data file
+# each. Every file holds 8 rows 3h apart with env alternating 'live'/'sandbox', so no bound prunes on env and core
+# withholds the LIMIT from the scan order. The TOP_N's dynamic filter on ts is then the only way to skip manifests.
+
+statement ok
+SET threads=1;
+
+statement ok
+SET enable_external_file_cache=false;
+
+statement ok
+CALL enable_logging(['FileSystem']);
+
+# Prunes: the 3 newest 'live' rows before the cutoff come from the two newest days; once the TOP_N holds them, the
+# remaining manifests' partition bounds fall below its boundary and are never opened.
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json')
+WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00'
+ORDER BY ts DESC, id LIMIT 3;
+----
+58
+56
+54
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+2
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Declines to prune: fewer matching rows than the LIMIT, so the TOP_N never fills, its filter never tightens and
+# every manifest is read. All 30 matching rows come back.
+query II
+SELECT count(*), sum(id) FROM (
+	SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json')
+	WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00'
+	ORDER BY ts DESC, id LIMIT 100
+);
+----
+30	870
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+8
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# scan_order_single_manifest: one append of 12 days, so ONE manifest whose 12 day-files are listed oldest-first.
+# Manifest ordering can't help here; the lazily read manifest's files are handed out newest-first instead.
+
+# Prunes: the newest file alone fills the TOP_N, and the other 11 files fall below its boundary at hand-out.
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_single_manifest/metadata/00001-6d09ed6c-01ed-4ee3-acbb-ca0957d35daf.metadata.json')
+WHERE env = 'live' AND ts < TIMESTAMP '2025-01-13 00:00:00'
+ORDER BY ts DESC, id LIMIT 3;
+----
+94
+92
+90
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%.parquet';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Declines to prune: 48 matching rows < LIMIT, so every file is opened and every matching row returned.
+query II
+SELECT count(*), sum(id) FROM (
+	SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_single_manifest/metadata/00001-6d09ed6c-01ed-4ee3-acbb-ca0957d35daf.metadata.json')
+	WHERE env = 'live' AND ts < TIMESTAMP '2025-01-13 00:00:00'
+	ORDER BY ts DESC, id LIMIT 100
+);
+----
+48	2256
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%.parquet';
+----
+12

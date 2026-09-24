@@ -11,6 +11,9 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 
@@ -773,6 +776,36 @@ bool IcebergMultiFileList::TryGetNextBatch(lock_guard<mutex> &guard) const {
 		view_cursor.has_current_batch = true;
 		return true;
 	}
+	if (shared_state->lazy_data_manifest_read) {
+		//! Lazy mode: every batch read so far has been consumed, so fetch the next selected manifest - but first
+		//! re-check it against the current filters, which by now may include a tightened dynamic filter.
+		auto &selected = shared_state->data_manifest_selected_indices;
+		while (shared_state->next_lazy_manifest < selected.size()) {
+			auto manifest_idx = selected[shared_state->next_lazy_manifest++];
+			auto &manifest = shared_state->committed_data_manifests[manifest_idx];
+			if (!ManifestMatchesFilter(manifest.file)) {
+				continue;
+			}
+			shared_state->lazy_manifest_index.assign(1, manifest_idx);
+			auto scan = AvroScan::ScanManifest(GetSnapshot(), shared_state->committed_data_manifests, options, fs,
+			                                   GetPath(), GetMetadata(), context, &shared_state->read_state,
+			                                   &shared_state->lazy_manifest_index);
+			manifest_file::ManifestReader reader(*scan);
+			while (!reader.Finished()) {
+				reader.Read();
+			}
+			//! Hand this manifest's files out in scan order too, so the TOP_N fills from the most promising files
+			//! and the dynamic filter check at hand-out (FileMatchesFilter) prunes the rest.
+			OrderManifestEntriesForScanOrder(manifest);
+			if (shared_state->read_state.GetBatch(view_cursor.next_batch_idx, view_cursor.current_batch)) {
+				view_cursor.next_batch_idx++;
+				view_cursor.current_batch_offset = view_cursor.current_batch.start_index;
+				view_cursor.has_current_batch = true;
+				return true;
+			}
+		}
+		return false;
+	}
 	if (!shared_state->data_manifest_read_state) {
 		return false;
 	}
@@ -1016,7 +1049,10 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
 	// (e.g. the GuaranteeEqualityDeleteColumnsOptimizer PreOptimize pass), reintroducing the exact
 	// OPTI-10702 regression via a different call path. Only actual per-file consumption needs it.
 	ScheduleDataManifestScan(guard);
-	EnsureScanOrderApplied(guard);
+	if (!shared_state->lazy_data_manifest_read) {
+		//! Materializes every file; in lazy mode files are instead handed out as their manifest is read.
+		EnsureScanOrderApplied(guard);
+	}
 
 	auto found_manifest_entry = GetDataFile(file_id, guard);
 	if (!found_manifest_entry) {
@@ -1368,6 +1404,76 @@ void IcebergMultiFileList::OrderManifestsForScanOrder(vector<idx_t> &selected) c
 	}
 }
 
+static bool ContainsDynamicFilter(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::DYNAMIC_FILTER:
+		return true;
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &optional = filter.Cast<OptionalFilter>();
+		return optional.child_filter && ContainsDynamicFilter(*optional.child_filter);
+	}
+	case TableFilterType::CONJUNCTION_AND:
+		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+			if (ContainsDynamicFilter(*child)) {
+				return true;
+			}
+		}
+		return false;
+	default:
+		return false;
+	}
+}
+
+bool IcebergMultiFileList::HasScanOrderDynamicFilter() const {
+	if (scan_order_options->column_idx.HasChildren()) {
+		return false;
+	}
+	auto it = table_filters.filters.find(scan_order_options->column_idx.GetPrimaryIndex());
+	return it != table_filters.filters.end() && ContainsDynamicFilter(*it->second);
+}
+
+void IcebergMultiFileList::OrderManifestEntriesForScanOrder(IcebergManifestListEntry &manifest) const {
+	auto &entries = manifest.manifest_entries;
+	auto &schema_columns = GetSchema().columns;
+	auto schema_idx = scan_order_options->column_idx.GetPrimaryIndex();
+	//! v3 row ids inherited by entry position must keep the written order.
+	if (entries.size() <= 1 || manifest.file.has_first_row_id || schema_idx >= schema_columns.size()) {
+		return;
+	}
+	auto &column = *schema_columns[schema_idx];
+	const bool descending = scan_order_options->order_by == OrderByStatistics::MAX;
+	//! Each file's order-column bound; NULL when unknown, which sorts first: such a file can hold anything.
+	vector<std::pair<Value, idx_t>> keyed;
+	keyed.reserve(entries.size());
+	for (idx_t i = 0; i < entries.size(); i++) {
+		auto &data_file = entries[i].data_file;
+		Value bound;
+		auto lower_it = data_file.lower_bounds.find(column.id);
+		auto upper_it = data_file.upper_bounds.find(column.id);
+		if (lower_it != data_file.lower_bounds.end() && upper_it != data_file.upper_bounds.end()) {
+			auto stats =
+			    IcebergPredicateStats::DeserializeBounds(lower_it->second, upper_it->second, column.name, column.type);
+			if (descending ? stats.has_upper_bounds : stats.has_lower_bounds) {
+				bound = descending ? stats.upper_bound : stats.lower_bound;
+			}
+		}
+		keyed.emplace_back(std::move(bound), i);
+	}
+	std::stable_sort(keyed.begin(), keyed.end(),
+	                 [&](const std::pair<Value, idx_t> &a, const std::pair<Value, idx_t> &b) {
+		                 if (a.first.IsNull() || b.first.IsNull()) {
+			                 return a.first.IsNull() && !b.first.IsNull();
+		                 }
+		                 return descending ? b.first < a.first : a.first < b.first;
+	                 });
+	vector<IcebergManifestEntry> ordered;
+	ordered.reserve(entries.size());
+	for (auto &entry : keyed) {
+		ordered.push_back(std::move(entries[entry.second]));
+	}
+	entries = std::move(ordered);
+}
+
 void IcebergMultiFileList::ScheduleDataManifestScan(lock_guard<mutex> &guard) const {
 	if (shared_state->data_manifest_scan_started) {
 		return;
@@ -1391,6 +1497,14 @@ void IcebergMultiFileList::ScheduleDataManifestScan(lock_guard<mutex> &guard) co
 	OrderManifestsForScanOrder(selected_manifests);
 
 	if (selected_manifests.empty()) {
+		return;
+	}
+
+	if (scan_order_options && !scan_order_options->row_limit.IsValid() && HasScanOrderDynamicFilter()) {
+		//! A TOP_N over a filtered scan: core withholds the LIMIT from the scan order, so the eager path below
+		//! can't prune, but the TOP_N pushes a dynamic filter on the order column that tightens as it fills.
+		//! Read the (ordered) manifests one at a time instead, so each is checked against that filter first.
+		shared_state->lazy_data_manifest_read = true;
 		return;
 	}
 
