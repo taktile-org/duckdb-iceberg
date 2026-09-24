@@ -15,6 +15,16 @@ IcebergSnapshotLookup IcebergSnapshotLookup::FromAtClause(optional_ptr<BoundAtCl
 		throw InvalidInputException("NULL values can not be used as the 'unit' of a time travel clause");
 	}
 	if (StringUtil::CIEquals(unit, "version")) {
+		//! The grammar only knows VERSION and TIMESTAMP, so a ref is a non-numeric VERSION string,
+		//! the same way Spark's VERSION AS OF resolves 'branch-name'.
+		Value snapshot_id;
+		string cast_error;
+		if (value.type().id() == LogicalTypeId::VARCHAR &&
+		    !value.DefaultTryCastAs(LogicalType::BIGINT, snapshot_id, &cast_error, true)) {
+			result.snapshot_source = SnapshotSource::FROM_REF;
+			result.snapshot_ref = StringValue::Get(value);
+			return result;
+		}
 		result.snapshot_source = SnapshotSource::FROM_ID;
 		result.snapshot_id = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 	} else if (StringUtil::CIEquals(unit, "timestamp")) {

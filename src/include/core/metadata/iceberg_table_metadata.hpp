@@ -29,6 +29,18 @@ public:
 	int64_t timestamp_ms;
 };
 
+//! A named snapshot reference ("refs" in the table metadata): a branch or a tag
+struct IcebergSnapshotRef {
+public:
+	bool IsBranch() const {
+		return type == "branch";
+	}
+
+public:
+	string type;
+	int64_t snapshot_id;
+};
+
 //! A structure to store "LoadTableResult" information that changes as a transaction goes on
 //! Everything is parsed from a load table result, but if a transaction changes a schema, those schema
 //! updates are reflected here and never within the catalog that lives beyond transactions
@@ -57,6 +69,7 @@ public:
 
 	optional_ptr<const IcebergSnapshot> GetSnapshotById(int64_t snapshot_id) const;
 	optional_ptr<const IcebergSnapshot> GetSnapshotByTimestamp(timestamp_t timestamp) const;
+	const IcebergSnapshotRef &GetSnapshotRef(const string &ref_name) const;
 
 	//! Version extraction and identification
 	static bool UnsafeVersionGuessingEnabled(ClientContext &context);
@@ -136,6 +149,8 @@ public:
 	//! Stored as raw millis (matching the REST API representation and last_updated_ms)
 	//! to keep all timestamp comparisons in a single unit.
 	vector<pair<int64_t /*snapshot_id*/, int64_t /*timestamp_ms*/>> snapshot_log;
+	//! ref name -> branch or tag. Ref names are case-sensitive per spec.
+	unordered_map<string, IcebergSnapshotRef> refs;
 	vector<IcebergFieldMapping> mappings;
 
 	//! Custom write paths from table properties
