@@ -1300,6 +1300,74 @@ void IcebergMultiFileList::InitializeSharedState(lock_guard<mutex> &guard) const
 	shared_state->initialized = true;
 }
 
+static bool IsOrderPreservingTransform(const IcebergTransform &transform) {
+	switch (transform.Type()) {
+	case IcebergTransformType::IDENTITY:
+	case IcebergTransformType::YEAR:
+	case IcebergTransformType::MONTH:
+	case IcebergTransformType::DAY:
+	case IcebergTransformType::HOUR:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void IcebergMultiFileList::OrderManifestsForScanOrder(vector<idx_t> &selected) const {
+	if (!scan_order_options || scan_order_options->column_idx.HasChildren()) {
+		return;
+	}
+	auto &column = *GetSchema().columns[scan_order_options->column_idx.GetPrimaryIndex()];
+	const bool descending = scan_order_options->order_type == OrderType::DESCENDING;
+	auto &metadata = GetMetadata();
+	auto &committed = shared_state->committed_data_manifests;
+	//! The order column's summary bound per manifest; NULL when unknown (no summary, no order-preserving partition
+	//! field on the column, or nulls present). Unknown manifests sort first: they can hold anything.
+	vector<std::pair<Value, idx_t>> keyed;
+	string common_transform;
+	bool comparable = true;
+	for (auto idx : selected) {
+		Value bound;
+		auto &manifest = committed[idx].file;
+		auto &summaries = manifest.partitions.field_summary;
+		auto spec_it = metadata.partition_specs.find(manifest.partition_spec_id);
+		if (manifest.partitions.has_partitions && spec_it != metadata.partition_specs.end() &&
+		    spec_it->second.fields.size() == summaries.size()) {
+			auto &fields = spec_it->second.fields;
+			for (idx_t i = 0; i < fields.size(); i++) {
+				auto &field = fields[i];
+				if (field.source_id != NumericCast<uint64_t>(column.id) ||
+				    !IsOrderPreservingTransform(field.transform) || summaries[i].contains_null) {
+					continue;
+				}
+				auto bound_type = field.transform.GetSerializedType(column.type);
+				auto stats = IcebergPredicateStats::DeserializeBounds(
+				    summaries[i].lower_bound, summaries[i].upper_bound, column.name, bound_type);
+				if (descending ? stats.has_upper_bounds : stats.has_lower_bounds) {
+					bound = descending ? stats.upper_bound : stats.lower_bound;
+					if (common_transform.empty()) {
+						common_transform = field.transform.RawType();
+					}
+					//! Hour and day numbers (e.g. after a spec evolution) aren't comparable: keep list order then.
+					comparable = comparable && common_transform == field.transform.RawType();
+				}
+				break;
+			}
+		}
+		keyed.emplace_back(std::move(bound), idx);
+	}
+	std::stable_sort(keyed.begin(), keyed.end(),
+	                 [&](const std::pair<Value, idx_t> &a, const std::pair<Value, idx_t> &b) {
+		                 if (a.first.IsNull() || b.first.IsNull()) {
+			                 return a.first.IsNull() && !b.first.IsNull();
+		                 }
+		                 return comparable && (descending ? b.first < a.first : a.first < b.first);
+	                 });
+	for (idx_t i = 0; i < keyed.size(); i++) {
+		selected[i] = keyed[i].second;
+	}
+}
+
 void IcebergMultiFileList::ScheduleDataManifestScan(lock_guard<mutex> &guard) const {
 	if (shared_state->data_manifest_scan_started) {
 		return;
@@ -1319,6 +1387,8 @@ void IcebergMultiFileList::ScheduleDataManifestScan(lock_guard<mutex> &guard) co
 		DUCKDB_LOG(context, IcebergLogType, "Iceberg Manifest Read Pushdown, opening %llu of %llu 'manifest_file's",
 		           selected_manifests.size(), committed_data_manifests.size());
 	}
+	//! Read order only: read_state batches carry each manifest's real index, so entry addressing is unaffected.
+	OrderManifestsForScanOrder(selected_manifests);
 
 	if (selected_manifests.empty()) {
 		return;

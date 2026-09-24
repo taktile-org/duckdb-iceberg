@@ -192,6 +192,9 @@ private:
 	//! (already computed by InitializeFiles for this instance's table_filters) marks as possibly-matching.
 	//! No-ops on every clone after the first to reach it - see the comment on shared_state->data_manifest_scan_started.
 	void ScheduleDataManifestScan(lock_guard<mutex> &guard) const;
+	//! With a scan order set, sorts 'selected' so manifests whose partition summary bound of the order column is
+	//! most promising come first (upper bound descending for DESC, lower bound ascending for ASC).
+	void OrderManifestsForScanOrder(vector<idx_t> &selected) const;
 	bool FinishedScanningDeletes() const;
 	void EnumerateDeleteManifestEntriesInternal() const;
 	void ProcessDeletesInternal(const vector<MultiFileColumnDefinition> &global_columns,
