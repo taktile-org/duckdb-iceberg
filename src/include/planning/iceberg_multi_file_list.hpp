@@ -146,6 +146,7 @@ public:
 	                                                   IcebergManifestContentType type) const;
 	vector<BoundIcebergManifestEntry> GetDeleteManifestEntries() const;
 	shared_ptr<IcebergDeleteData> GetExistingPositionalDeleteData(const string &file_path) const;
+	void ScheduleDataManifestScan() const;
 
 public:
 	//! MultiFileList API

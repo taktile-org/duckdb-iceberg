@@ -1061,6 +1061,12 @@ OpenFileInfo IcebergMultiFileList::GetFile(idx_t file_id) const {
 	return GetFileInternal(file_id, guard);
 }
 
+void IcebergMultiFileList::ScheduleDataManifestScan() const {
+	lock_guard<mutex> guard(shared_state->lock);
+	InitializeFiles(guard);
+	ScheduleDataManifestScan(guard);
+}
+
 bool IcebergMultiFileList::ManifestMatchesFilter(const IcebergManifestFile &manifest) const {
 	auto spec_id = manifest.partition_spec_id;
 	auto &metadata = GetMetadata();

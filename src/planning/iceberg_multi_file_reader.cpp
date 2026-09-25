@@ -81,6 +81,11 @@ IcebergMultiFileReader::InitializeGlobalState(ClientContext &context, const Mult
                                               const MultiFileReaderBindData &bind_data, const MultiFileList &file_list,
                                               const vector<MultiFileColumnDefinition> &global_columns,
                                               const vector<ColumnIndex> &global_column_ids) {
+	// Workers are idle during InitGlobal; once InitLocal runs they all block on the scan lock.
+	auto iceberg_file_list = dynamic_cast<const IcebergMultiFileList *>(&file_list);
+	if (iceberg_file_list) {
+		iceberg_file_list->ScheduleDataManifestScan();
+	}
 	vector<LogicalType> extra_columns;
 	auto res = make_uniq<IcebergMultiFileReaderGlobalState>(std::move(extra_columns), file_list);
 	return std::move(res);
