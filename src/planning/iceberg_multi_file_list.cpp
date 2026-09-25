@@ -1010,7 +1010,8 @@ void IcebergMultiFileList::EnsureScanOrderApplied(lock_guard<mutex> &guard) cons
 			const Value &frontier = primary(order_entries[k]);
 			idx_t guaranteed = 0;
 			for (idx_t j = 0; j < k; j++) {
-				if (!ScanOrderCompare(opposite(order_entries[j]), frontier, stat_type)) {
+				//! Strictly better only: rows tied with the frontier can still lose on a later ORDER BY key.
+				if (ScanOrderCompare(frontier, opposite(order_entries[j]), stat_type)) {
 					guaranteed += order_entries[j].count;
 				}
 				if (guaranteed >= row_limit) {
