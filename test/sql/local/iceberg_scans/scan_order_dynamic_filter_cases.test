@@ -1,0 +1,1683 @@
+# name: test/sql/local/iceberg_scans/scan_order_dynamic_filter_cases.test
+# description: TOP_N dynamic-filter manifest/file pruning against an eager oracle across table shapes
+# group: [iceberg_scans]
+
+require avro
+
+require parquet
+
+require iceberg
+
+# Fixtures: scripts/topk_scan_order/generate.py (and scan_order_dynamic_filter, "days" below: 8 day-commits in
+# shuffled order, 8 rows each 3h apart, ids day*8+slot, env alternating live/sandbox). Every case materializes the
+# iceberg result into `got` and compares it, as a multiset, with the same query over `o_<table>`: a native copy made
+# by a plain SELECT * iceberg_scan (no ORDER BY, so no scan order, no dynamic filter, the eager path). The ORDER BY
+# keys are total, so the top-k set is unique. Manifest-read counts are asserted only at threads=1 where the TOP_N
+# boundary is reached at a fixed point.
+
+statement ok
+SET enable_external_file_cache=false;
+
+statement ok
+CALL enable_logging(['FileSystem']);
+
+statement ok
+CREATE TABLE o_days AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json');
+
+statement ok
+CREATE TABLE o_ties_a AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_a/metadata/00004-18d33593-4483-40f1-a921-910448e2f002.metadata.json');
+
+statement ok
+CREATE TABLE o_ties_b AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_b/metadata/00004-10826d79-58d9-4860-887a-f708cc8eb1fd.metadata.json');
+
+statement ok
+CREATE TABLE o_nulls AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json');
+
+statement ok
+CREATE TABLE o_hour AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/hour/metadata/00008-f4f55e27-4cf5-4389-8bf2-366a10ed40ab.metadata.json');
+
+statement ok
+CREATE TABLE o_month AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/month/metadata/00006-42a63140-88c2-47e1-9ea0-44b8e049e6fb.metadata.json');
+
+statement ok
+CREATE TABLE o_date_identity AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/date_identity/metadata/00008-c4394f27-d553-47e7-8b07-c2480d3fa477.metadata.json');
+
+statement ok
+CREATE TABLE o_evolved AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/evolved/metadata/00009-f75a14a5-a080-4cf4-a44e-eb0504434695.metadata.json');
+
+statement ok
+CREATE TABLE o_unpartitioned AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/unpartitioned/metadata/00005-bd383fe7-e87b-4e86-9fd3-3957d1b9bdd1.metadata.json');
+
+statement ok
+CREATE TABLE o_varchar_identity AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/varchar_identity/metadata/00008-feecade5-5808-4b23-bec3-2e423f74be69.metadata.json');
+
+statement ok
+CREATE TABLE o_struct AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/struct/metadata/00006-c90620d2-4a1e-40f7-a3fd-349c99d98255.metadata.json');
+
+statement ok
+CREATE TABLE o_pos_delete AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/pos_delete/metadata/v-final.metadata.json');
+
+statement ok
+CREATE TABLE o_eq_delete AS SELECT * FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/eq_delete/metadata/v-final.metadata.json');
+
+statement ok
+CREATE TABLE envs AS SELECT 'live' AS e;
+
+
+# 1. ASC prunes (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 3;
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+2
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+query II
+SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 3;
+----
+4	2025-01-01 12:00:00
+6	2025-01-01 18:00:00
+8	2025-01-02 00:00:00
+
+
+# 1. ASC declines (LIMIT beyond the 31 matching rows) (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 100;
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+8
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 2. ties across manifests, ties_a (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_a/metadata/00004-18d33593-4483-40f1-a921-910448e2f002.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+3
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_ties_a WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+query II
+SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_a/metadata/00004-18d33593-4483-40f1-a921-910448e2f002.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+----
+61	2025-01-07 02:00:00
+60	2025-01-07 01:00:00
+1	2025-01-06 12:00:00
+2	2025-01-06 12:00:00
+
+
+# 2. ties across manifests, ties_b (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_b/metadata/00004-10826d79-58d9-4860-887a-f708cc8eb1fd.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+3
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_ties_b WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+query II
+SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_b/metadata/00004-10826d79-58d9-4860-887a-f708cc8eb1fd.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+----
+61	2025-01-07 02:00:00
+60	2025-01-07 01:00:00
+1	2025-01-06 12:00:00
+2	2025-01-06 12:00:00
+
+
+# 3. nulls, ORDER BY ts DESC NULLS FIRST (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts DESC NULLS FIRST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts DESC NULLS FIRST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, ORDER BY ts DESC NULLS LAST (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts DESC NULLS LAST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts DESC NULLS LAST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, ORDER BY ts ASC NULLS FIRST (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts ASC NULLS FIRST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts ASC NULLS FIRST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, ORDER BY ts ASC NULLS LAST (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts ASC NULLS LAST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts ASC NULLS LAST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, NULLS LAST with a range filter (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE ts < TIMESTAMP '2025-01-04 10:00:00' ORDER BY ts DESC NULLS LAST, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE ts < TIMESTAMP '2025-01-04 10:00:00' ORDER BY ts DESC NULLS LAST, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. hour(ts) partitions, DESC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/hour/metadata/00008-f4f55e27-4cf5-4389-8bf2-366a10ed40ab.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_hour WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. hour(ts) partitions, ASC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/hour/metadata/00008-f4f55e27-4cf5-4389-8bf2-366a10ed40ab.metadata.json') WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_hour WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. month(ts) partitions, DESC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/month/metadata/00006-42a63140-88c2-47e1-9ea0-44b8e049e6fb.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_month WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. month(ts) partitions, ASC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/month/metadata/00006-42a63140-88c2-47e1-9ea0-44b8e049e6fb.metadata.json') WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_month WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. identity DATE partitions (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, d FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/date_identity/metadata/00008-c4394f27-d553-47e7-8b07-c2480d3fa477.metadata.json') WHERE env = 'live' ORDER BY d DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, d FROM o_date_identity WHERE env = 'live' ORDER BY d DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. identity DATE partitions, ASC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, d FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/date_identity/metadata/00008-c4394f27-d553-47e7-8b07-c2480d3fa477.metadata.json') WHERE env = 'live' ORDER BY d ASC, id DESC LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, d FROM o_date_identity WHERE env = 'live' ORDER BY d ASC, id DESC LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. spec evolution hour -> day, DESC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/evolved/metadata/00009-f75a14a5-a080-4cf4-a44e-eb0504434695.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_evolved WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. spec evolution hour -> day, ASC (answer in the hour-spec half) (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/evolved/metadata/00009-f75a14a5-a080-4cf4-a44e-eb0504434695.metadata.json') WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_evolved WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. spec evolution hour -> day, LIMIT spanning both specs (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/evolved/metadata/00009-f75a14a5-a080-4cf4-a44e-eb0504434695.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 20;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_evolved WHERE env = 'live' ORDER BY ts DESC, id LIMIT 20;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 5. unpartitioned (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/unpartitioned/metadata/00005-bd383fe7-e87b-4e86-9fd3-3957d1b9bdd1.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+5
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_unpartitioned WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 6. pos_delete (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/pos_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_pos_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+query II
+SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/pos_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+----
+42	2025-01-06 06:00:00
+40	2025-01-06 00:00:00
+38	2025-01-05 18:00:00
+
+
+# 6. pos_delete, deleted rows absent from a larger page (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/pos_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_pos_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 6. eq_delete (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/eq_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_eq_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+query II
+SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/eq_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+----
+42	2025-01-06 06:00:00
+40	2025-01-06 00:00:00
+38	2025-01-05 18:00:00
+
+
+# 6. eq_delete, deleted rows absent from a larger page (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/eq_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_eq_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. UNION ALL: recent full branch + top-k branch, outer top-k (exporter shape) (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-08 06:00:00' UNION ALL (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 06:00:00' ORDER BY ts DESC, id LIMIT 5)) ORDER BY ts DESC, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM (SELECT id, ts FROM o_days WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-08 06:00:00' UNION ALL (SELECT id, ts FROM o_days WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 06:00:00' ORDER BY ts DESC, id LIMIT 5)) ORDER BY ts DESC, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. UNION ALL of two differently filtered top-k branches (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM ((SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4) UNION ALL (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'sandbox' AND ts < TIMESTAMP '2025-01-07 00:00:00' ORDER BY ts DESC, id LIMIT 4)) ORDER BY ts DESC, id LIMIT 6;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM ((SELECT id, ts FROM o_days WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4) UNION ALL (SELECT id, ts FROM o_days WHERE env = 'sandbox' AND ts < TIMESTAMP '2025-01-07 00:00:00' ORDER BY ts DESC, id LIMIT 4)) ORDER BY ts DESC, id LIMIT 6;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. UNION ALL under one outer top-k, no inner LIMIT (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' UNION ALL SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM (SELECT id, ts FROM o_days WHERE env = 'live' UNION ALL SELECT id, ts FROM o_days WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. self-join (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT a.id, a.ts, b.id AS bid FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') a JOIN iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') b ON b.id = a.id + 1 WHERE a.env = 'live' ORDER BY a.ts DESC, a.id LIMIT 4;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT a.id, a.ts, b.id AS bid FROM o_days a JOIN o_days b ON b.id = a.id + 1 WHERE a.env = 'live' ORDER BY a.ts DESC, a.id LIMIT 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. CTE referenced twice (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS WITH x AS (SELECT id, ts, env FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json')) SELECT id, ts FROM (SELECT id, ts FROM x WHERE env = 'live' UNION ALL SELECT id + 1000, ts FROM x WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS WITH x AS (SELECT id, ts, env FROM o_days) SELECT id, ts FROM (SELECT id, ts FROM x WHERE env = 'live' UNION ALL SELECT id + 1000, ts FROM x WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 9. LIMIT 3 OFFSET 4 (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3 OFFSET 4;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3 OFFSET 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 9. LIMIT 2 OFFSET 9 (offset spans files) (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 2 OFFSET 9;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 2 OFFSET 9;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 10. VARCHAR identity, DESC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, s FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/varchar_identity/metadata/00008-feecade5-5808-4b23-bec3-2e423f74be69.metadata.json') WHERE env = 'live' ORDER BY s DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, s FROM o_varchar_identity WHERE env = 'live' ORDER BY s DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 10. VARCHAR identity, ASC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, s FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/varchar_identity/metadata/00008-feecade5-5808-4b23-bec3-2e423f74be69.metadata.json') WHERE env = 'live' ORDER BY s ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, s FROM o_varchar_identity WHERE env = 'live' ORDER BY s ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 10. VARCHAR identity, range filter + DESC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, s FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/varchar_identity/metadata/00008-feecade5-5808-4b23-bec3-2e423f74be69.metadata.json') WHERE env = 'live' AND s < 'shared-prefix-012345-05' ORDER BY s DESC, id LIMIT 6;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, s FROM o_varchar_identity WHERE env = 'live' AND s < 'shared-prefix-012345-05' ORDER BY s DESC, id LIMIT 6;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 11. hash-join dynamic filter on env (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT t.id, t.ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') t JOIN envs ON t.env = envs.e ORDER BY t.ts DESC, t.id LIMIT 3;
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+8
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT t.id, t.ts FROM o_days t JOIN envs ON t.env = envs.e ORDER BY t.ts DESC, t.id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 12. order column not selected (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+
+query I
+SELECT count(DISTINCT path) FROM duckdb_logs_parsed('FileSystem') WHERE path LIKE '%-m0.avro';
+----
+2
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id FROM o_days WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+----
+58
+56
+54
+
+
+# 12. ORDER BY a struct field (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/struct/metadata/00006-c90620d2-4a1e-40f7-a3fd-349c99d98255.metadata.json') WHERE env = 'live' ORDER BY st.t DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id FROM o_struct WHERE env = 'live' ORDER BY st.t DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 12. ORDER BY a struct field, ASC (threads=1)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/struct/metadata/00006-c90620d2-4a1e-40f7-a3fd-349c99d98255.metadata.json') WHERE env = 'live' ORDER BY st.t ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id FROM o_struct WHERE env = 'live' ORDER BY st.t ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 7. Every case again with 4 threads: rows only.
+
+# 1. ASC prunes (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 1. ASC declines (LIMIT beyond the 31 matching rows) (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-01 12:00:00' ORDER BY ts ASC, id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 2. ties across manifests, ties_a (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_a/metadata/00004-18d33593-4483-40f1-a921-910448e2f002.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_ties_a WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 2. ties across manifests, ties_b (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/ties_b/metadata/00004-10826d79-58d9-4860-887a-f708cc8eb1fd.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_ties_b WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, ORDER BY ts DESC NULLS FIRST (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts DESC NULLS FIRST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts DESC NULLS FIRST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, ORDER BY ts DESC NULLS LAST (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts DESC NULLS LAST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts DESC NULLS LAST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, ORDER BY ts ASC NULLS FIRST (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts ASC NULLS FIRST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts ASC NULLS FIRST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, ORDER BY ts ASC NULLS LAST (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE env = 'live' ORDER BY ts ASC NULLS LAST, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE env = 'live' ORDER BY ts ASC NULLS LAST, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 3. nulls, NULLS LAST with a range filter (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/nulls/metadata/00007-3b8e0334-5316-448c-a16e-af1f310d2047.metadata.json') WHERE ts < TIMESTAMP '2025-01-04 10:00:00' ORDER BY ts DESC NULLS LAST, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_nulls WHERE ts < TIMESTAMP '2025-01-04 10:00:00' ORDER BY ts DESC NULLS LAST, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. hour(ts) partitions, DESC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/hour/metadata/00008-f4f55e27-4cf5-4389-8bf2-366a10ed40ab.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_hour WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. hour(ts) partitions, ASC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/hour/metadata/00008-f4f55e27-4cf5-4389-8bf2-366a10ed40ab.metadata.json') WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_hour WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. month(ts) partitions, DESC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/month/metadata/00006-42a63140-88c2-47e1-9ea0-44b8e049e6fb.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_month WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. month(ts) partitions, ASC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/month/metadata/00006-42a63140-88c2-47e1-9ea0-44b8e049e6fb.metadata.json') WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_month WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. identity DATE partitions (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, d FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/date_identity/metadata/00008-c4394f27-d553-47e7-8b07-c2480d3fa477.metadata.json') WHERE env = 'live' ORDER BY d DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, d FROM o_date_identity WHERE env = 'live' ORDER BY d DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. identity DATE partitions, ASC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, d FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/date_identity/metadata/00008-c4394f27-d553-47e7-8b07-c2480d3fa477.metadata.json') WHERE env = 'live' ORDER BY d ASC, id DESC LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, d FROM o_date_identity WHERE env = 'live' ORDER BY d ASC, id DESC LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. spec evolution hour -> day, DESC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/evolved/metadata/00009-f75a14a5-a080-4cf4-a44e-eb0504434695.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_evolved WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. spec evolution hour -> day, ASC (answer in the hour-spec half) (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/evolved/metadata/00009-f75a14a5-a080-4cf4-a44e-eb0504434695.metadata.json') WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_evolved WHERE env = 'live' ORDER BY ts ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 4. spec evolution hour -> day, LIMIT spanning both specs (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/evolved/metadata/00009-f75a14a5-a080-4cf4-a44e-eb0504434695.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 20;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_evolved WHERE env = 'live' ORDER BY ts DESC, id LIMIT 20;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 5. unpartitioned (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/unpartitioned/metadata/00005-bd383fe7-e87b-4e86-9fd3-3957d1b9bdd1.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_unpartitioned WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 6. pos_delete (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/pos_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_pos_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 6. pos_delete, deleted rows absent from a larger page (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/pos_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_pos_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 6. eq_delete (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/eq_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_eq_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 6. eq_delete, deleted rows absent from a larger page (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/eq_delete/metadata/v-final.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_eq_delete WHERE env = 'live' ORDER BY ts DESC, id LIMIT 10;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. UNION ALL: recent full branch + top-k branch, outer top-k (exporter shape) (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-08 06:00:00' UNION ALL (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 06:00:00' ORDER BY ts DESC, id LIMIT 5)) ORDER BY ts DESC, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM (SELECT id, ts FROM o_days WHERE env = 'live' AND ts >= TIMESTAMP '2025-01-08 06:00:00' UNION ALL (SELECT id, ts FROM o_days WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 06:00:00' ORDER BY ts DESC, id LIMIT 5)) ORDER BY ts DESC, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. UNION ALL of two differently filtered top-k branches (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM ((SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4) UNION ALL (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'sandbox' AND ts < TIMESTAMP '2025-01-07 00:00:00' ORDER BY ts DESC, id LIMIT 4)) ORDER BY ts DESC, id LIMIT 6;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM ((SELECT id, ts FROM o_days WHERE env = 'live' ORDER BY ts DESC, id LIMIT 4) UNION ALL (SELECT id, ts FROM o_days WHERE env = 'sandbox' AND ts < TIMESTAMP '2025-01-07 00:00:00' ORDER BY ts DESC, id LIMIT 4)) ORDER BY ts DESC, id LIMIT 6;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. UNION ALL under one outer top-k, no inner LIMIT (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM (SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' UNION ALL SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM (SELECT id, ts FROM o_days WHERE env = 'live' UNION ALL SELECT id, ts FROM o_days WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. self-join (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT a.id, a.ts, b.id AS bid FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') a JOIN iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') b ON b.id = a.id + 1 WHERE a.env = 'live' ORDER BY a.ts DESC, a.id LIMIT 4;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT a.id, a.ts, b.id AS bid FROM o_days a JOIN o_days b ON b.id = a.id + 1 WHERE a.env = 'live' ORDER BY a.ts DESC, a.id LIMIT 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 8. CTE referenced twice (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS WITH x AS (SELECT id, ts, env FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json')) SELECT id, ts FROM (SELECT id, ts FROM x WHERE env = 'live' UNION ALL SELECT id + 1000, ts FROM x WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+statement ok
+CREATE OR REPLACE TABLE want AS WITH x AS (SELECT id, ts, env FROM o_days) SELECT id, ts FROM (SELECT id, ts FROM x WHERE env = 'live' UNION ALL SELECT id + 1000, ts FROM x WHERE env = 'sandbox') ORDER BY ts DESC, id LIMIT 5;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 9. LIMIT 3 OFFSET 4 (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3 OFFSET 4;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' ORDER BY ts DESC, id LIMIT 3 OFFSET 4;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 9. LIMIT 2 OFFSET 9 (offset spans files) (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 2 OFFSET 9;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, ts FROM o_days WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 2 OFFSET 9;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 10. VARCHAR identity, DESC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, s FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/varchar_identity/metadata/00008-feecade5-5808-4b23-bec3-2e423f74be69.metadata.json') WHERE env = 'live' ORDER BY s DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, s FROM o_varchar_identity WHERE env = 'live' ORDER BY s DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 10. VARCHAR identity, ASC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, s FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/varchar_identity/metadata/00008-feecade5-5808-4b23-bec3-2e423f74be69.metadata.json') WHERE env = 'live' ORDER BY s ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, s FROM o_varchar_identity WHERE env = 'live' ORDER BY s ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 10. VARCHAR identity, range filter + DESC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id, s FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/varchar_identity/metadata/00008-feecade5-5808-4b23-bec3-2e423f74be69.metadata.json') WHERE env = 'live' AND s < 'shared-prefix-012345-05' ORDER BY s DESC, id LIMIT 6;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id, s FROM o_varchar_identity WHERE env = 'live' AND s < 'shared-prefix-012345-05' ORDER BY s DESC, id LIMIT 6;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 11. hash-join dynamic filter on env (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT t.id, t.ts FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') t JOIN envs ON t.env = envs.e ORDER BY t.ts DESC, t.id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT t.id, t.ts FROM o_days t JOIN envs ON t.env = envs.e ORDER BY t.ts DESC, t.id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 12. order column not selected (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id FROM o_days WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 12. ORDER BY a struct field (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/struct/metadata/00006-c90620d2-4a1e-40f7-a3fd-349c99d98255.metadata.json') WHERE env = 'live' ORDER BY st.t DESC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id FROM o_struct WHERE env = 'live' ORDER BY st.t DESC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 12. ORDER BY a struct field, ASC (threads=4)
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/topk_scan_order/struct/metadata/00006-c90620d2-4a1e-40f7-a3fd-349c99d98255.metadata.json') WHERE env = 'live' ORDER BY st.t ASC, id LIMIT 3;
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT id FROM o_struct WHERE env = 'live' ORDER BY st.t ASC, id LIMIT 3;
+
+query II
+SELECT (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) + (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)), (SELECT count(*) > 0 FROM want)::INT;
+----
+0	1
+
+
+# 13. Re-execution on one connection: the same query twice, a different LIMIT, a prepared statement executed
+# repeatedly (its bind data, and any multi-file list state, is reused), then with the external file cache on.
+statement ok
+SET threads=1;
+
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+----
+58
+56
+54
+
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+----
+58
+56
+54
+
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 5;
+----
+58
+56
+54
+52
+50
+
+statement ok
+PREPARE topk AS SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT $1;
+
+query I
+EXECUTE topk(3);
+----
+58
+56
+54
+
+query I
+EXECUTE topk(3);
+----
+58
+56
+54
+
+query I
+EXECUTE topk(5);
+----
+58
+56
+54
+52
+50
+
+query I
+EXECUTE topk(3);
+----
+58
+56
+54
+
+statement ok
+SET enable_external_file_cache=true;
+
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+----
+58
+56
+54
+
+query I
+EXECUTE topk(5);
+----
+58
+56
+54
+52
+50
+
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 3;
+----
+58
+56
+54
+
+query I
+EXECUTE topk(5);
+----
+58
+56
+54
+52
+50
+
+query I
+SELECT id FROM iceberg_scan('__WORKING_DIRECTORY__/data/persistent/scan_order_dynamic_filter/metadata/00008-68027992-f915-4363-9a69-16aaf856e256.metadata.json') WHERE env = 'live' AND ts < TIMESTAMP '2025-01-08 12:00:00' ORDER BY ts DESC, id LIMIT 100;
+----
+58
+56
+54
+52
+50
+48
+46
+44
+42
+40
+38
+36
+34
+32
+30
+28
+26
+24
+22
+20
+18
+16
+14
+12
+10
+8
+6
+4
+2
+0
+
